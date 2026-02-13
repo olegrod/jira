@@ -6,8 +6,6 @@ import aiohttp
 import pandas as pd
 from datetime import datetime
 import json
-import nest_asyncio
-nest_asyncio.apply()
 
 app = func.FunctionApp()
 
@@ -260,24 +258,16 @@ async def fetch_worklogs_async(projects, start_date, end_date):
         return pd.DataFrame(rows)
 
 @app.route(route="worklogs", auth_level=func.AuthLevel.FUNCTION)
-def get_worklogs(req: func.HttpRequest) -> func.HttpResponse:
-    # Get parameters
+async def get_worklogs(req: func.HttpRequest) -> func.HttpResponse:
     projects = req.params.get('projects', 'CARE,UMVISION,PFORM,POP,OPS,ENG,CHANGE,AFNDRY')
     start_date = req.params.get('start_date', '2026-01-01')
     end_date = req.params.get('end_date', '2026-02-28')
     
     projects_list = [p.strip() for p in projects.split(',')]
     
-    # Fetch goals
     goals_df = fetch_goals()
+    df = await fetch_worklogs_async(projects_list, start_date, end_date)
     
-    # Fetch worklogs
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    df = loop.run_until_complete(fetch_worklogs_async(projects_list, start_date, end_date))
-    loop.close()
-    
-    # Join goals
     if not df.empty and not goals_df.empty:
         df = df.merge(goals_df[["Goal_ARI", "Goal_Key", "Goal_Name_Lookup"]], on="Goal_ARI", how="left")
         df.rename(columns={"Goal_Name_Lookup": "Goal"}, inplace=True)
