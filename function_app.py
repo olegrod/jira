@@ -289,12 +289,3 @@ def get_worklogs(req: func.HttpRequest) -> func.HttpResponse:
         df.to_json(orient='records', date_format='iso'),
         mimetype="application/json"
     )
-```
-
-**requirements.txt:**
-```
-azure-functions
-aiohttp
-pandas
-nest_asyncio
-requests
