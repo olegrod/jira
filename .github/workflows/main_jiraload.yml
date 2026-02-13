@@ -35,7 +35,9 @@ jobs:
           source venv/bin/activate
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          mkdir -p .python_packages/lib/site-packages
+          pip install --target=".python_packages/lib/site-packages" -r requirements.txt
 
       # Optional: Add step to run tests here
 
@@ -82,4 +84,5 @@ jobs:
           app-name: 'jiraload'
           slot-name: 'Production'
           package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
+
           
