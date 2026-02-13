@@ -1,0 +1,5 @@
+azure-functions
+aiohttp
+pandas
+nest_asyncio
+requests
