@@ -298,7 +298,7 @@ async def fetch_worklogs_async(projects, start_date, end_date):
         return pd.DataFrame(rows)
 
 
-@app.route(route="worklogs", auth_level=func.AuthLevel.FUNCTION)
+@app.route(route="worklogs", auth_level=func.AuthLevel.ANONYMOUS)
 async def get_worklogs(req: func.HttpRequest) -> func.HttpResponse:
     try:
         projects = req.params.get('projects', 'CARE,UMVISION,PFORM,POP,OPS,ENG,CHANGE,AFNDRY')
@@ -334,28 +334,6 @@ async def get_worklogs(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500
         )
 
-
-@app.route(route="ping", auth_level=func.AuthLevel.ANONYMOUS)
-def ping(req: func.HttpRequest) -> func.HttpResponse:
-    try:
-        import requests as req_lib
-        req_ok = "OK"
-    except Exception:
-        req_ok = "MISSING"
-    try:
-        import aiohttp as aio_lib
-        aio_ok = "OK"
-    except Exception:
-        aio_ok = "MISSING"
-    try:
-        import pandas as pd_lib
-        pd_ok = "OK"
-    except Exception:
-        pd_ok = "MISSING"
-    return func.HttpResponse(
-        f"requests: {req_ok}\naiohttp: {aio_ok}\npandas: {pd_ok}",
-        mimetype="text/plain"
-    )
 
 
 @app.route(route="debug", auth_level=func.AuthLevel.ANONYMOUS)
