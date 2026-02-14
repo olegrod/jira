@@ -98,6 +98,14 @@ async def get_all_issues(session, projects, start_date, end_date):
     jql = f"project IN ({projects_str}) AND worklogDate >= '{start_date}' AND worklogDate <= '{end_date}'"
     issues = []
     next_page_token = None
+    
+    JIRA_EMAIL, JIRA_API_TOKEN = get_credentials()
+    auth_string = base64.b64encode(f"{JIRA_EMAIL}:{JIRA_API_TOKEN}".encode()).decode()
+    headers = {
+        "Authorization": f"Basic {auth_string}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
 
     while True:
         payload = {
@@ -108,25 +116,20 @@ async def get_all_issues(session, projects, start_date, end_date):
         if next_page_token:
             payload["nextPageToken"] = next_page_token
 
-        url = f"{JIRA_BASE_URL}/rest/api/3/search/jql"
-        try:
-            async with session.post(
-                url,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as resp:
-                if resp.status != 200:
-                    break
-                data = await resp.json()
-        except Exception:
-            break
+        async with session.post(
+            f"{JIRA_BASE_URL}/rest/api/3/search/jql",
+            json=payload,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=30)
+        ) as resp:
+            if resp.status != 200:
+                break
+            data = await resp.json()
 
         batch = data.get("issues", [])
         if not batch:
             break
         issues.extend(batch)
-
-        # POST-based pagination works correctly unlike GET
         next_page_token = data.get("nextPageToken")
         if not next_page_token or data.get("isLast", False):
             break
@@ -363,9 +366,10 @@ def debug(req: func.HttpRequest) -> func.HttpResponse:
         import requests
         JIRA_EMAIL, JIRA_API_TOKEN = get_credentials()
 
+        # Step 1: search
         payload = {
             "jql": "project IN (CARE) AND worklogDate >= '2026-01-01' AND worklogDate <= '2026-02-28'",
-            "fields": ["summary"],
+            "fields": ["summary", "project", "parent", "issuetype"],
             "maxResults": 1
         }
         resp = requests.post(
@@ -374,8 +378,24 @@ def debug(req: func.HttpRequest) -> func.HttpResponse:
             json=payload,
             timeout=10
         )
+        data = resp.json()
+        issues = data.get("issues", [])
+        if not issues:
+            return func.HttpResponse(f"Search OK but no issues\n{resp.text[:300]}", mimetype="text/plain")
+
+        issue_key = issues[0]["key"]
+
+        # Step 2: fetch worklogs for that issue
+        resp2 = requests.get(
+            f"{JIRA_BASE_URL}/rest/api/3/issue/{issue_key}/worklog?maxResults=5&startAt=0",
+            auth=(JIRA_EMAIL, JIRA_API_TOKEN),
+            timeout=10
+        )
+
         return func.HttpResponse(
-            f"Status: {resp.status_code}\nBody: {resp.text[:500]}",
+            f"Issue: {issue_key}\n"
+            f"Worklog status: {resp2.status_code}\n"
+            f"Worklog body: {resp2.text[:500]}",
             mimetype="text/plain"
         )
     except Exception as e:
