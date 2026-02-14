@@ -281,10 +281,29 @@ async def get_worklogs(req: func.HttpRequest) -> func.HttpResponse:
     )
 
 @app.route(route="debug", auth_level=func.AuthLevel.ANONYMOUS)
-def debug(req: func.HttpRequest) -> func.HttpResponse:
-    email = os.environ.get("JIRA_EMAIL", "NOT SET")
-    token = os.environ.get("JIRA_API_TOKEN", "NOT SET")
+async def debug(req: func.HttpRequest) -> func.HttpResponse:
+    import aiohttp
+    JIRA_EMAIL, JIRA_API_TOKEN = get_credentials()
+    auth = aiohttp.BasicAuth(JIRA_EMAIL, JIRA_API_TOKEN)
+    
+    async with aiohttp.ClientSession(auth=auth) as session:
+        # Test 1: can we reach Jira at all?
+        url = f"{JIRA_BASE_URL}/rest/api/3/myself"
+        async with session.get(url) as resp:
+            me = await resp.json()
+            me_status = resp.status
+        
+        # Test 2: how many issues does JQL find?
+        jql = "project IN (CARE) AND worklogDate >= '2026-01-01' AND worklogDate <= '2026-02-28'"
+        url2 = f"{JIRA_BASE_URL}/rest/api/3/search/jql?jql={jql}&maxResults=1"
+        async with session.get(url2) as resp2:
+            search = await resp2.json()
+            search_status = resp2.status
+
     return func.HttpResponse(
-        f"EMAIL: {email[:20]}... TOKEN: {token[:10]}...",
+        f"Jira auth status: {me_status}\n"
+        f"Me: {me.get('displayName', me)}\n\n"
+        f"Search status: {search_status}\n"
+        f"Total issues found: {search.get('total', search)}",
         mimetype="text/plain"
     )
