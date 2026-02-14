@@ -91,21 +91,11 @@ async def fetch_json(session, url):
         pass
     return None
 
-# FIX: Use /rest/api/3/search with startAt pagination
-# /rest/api/3/search/jql is broken for pagination (Atlassian known issue)
 async def get_all_issues(session, projects, start_date, end_date):
     projects_str = ",".join(projects)
     jql = f"project IN ({projects_str}) AND worklogDate >= '{start_date}' AND worklogDate <= '{end_date}'"
     issues = []
     next_page_token = None
-    
-    JIRA_EMAIL, JIRA_API_TOKEN = get_credentials()
-    auth_string = base64.b64encode(f"{JIRA_EMAIL}:{JIRA_API_TOKEN}".encode()).decode()
-    headers = {
-        "Authorization": f"Basic {auth_string}",
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-    }
 
     while True:
         payload = {
@@ -119,7 +109,6 @@ async def get_all_issues(session, projects, start_date, end_date):
         async with session.post(
             f"{JIRA_BASE_URL}/rest/api/3/search/jql",
             json=payload,
-            headers=headers,
             timeout=aiohttp.ClientTimeout(total=30)
         ) as resp:
             if resp.status != 200:
@@ -226,11 +215,20 @@ async def fetch_worklogs_async(projects, start_date, end_date):
     JIRA_EMAIL, JIRA_API_TOKEN = get_credentials()
     filter_start = datetime.strptime(start_date, "%Y-%m-%d").date()
     filter_end = datetime.strptime(end_date, "%Y-%m-%d").date()
-    auth = aiohttp.BasicAuth(JIRA_EMAIL, JIRA_API_TOKEN)
+    
+    # Build auth header once for all requests
+    auth_string = base64.b64encode(f"{JIRA_EMAIL}:{JIRA_API_TOKEN}".encode()).decode()
+    default_headers = {
+        "Authorization": f"Basic {auth_string}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
     epic_cache = {}
 
-    async with aiohttp.ClientSession(auth=auth) as session:
+    # No auth= in session — use headers instead everywhere
+    async with aiohttp.ClientSession(headers=default_headers) as session:
         issues = await get_all_issues(session, projects, start_date, end_date)
         if not issues:
             return pd.DataFrame()
