@@ -282,27 +282,43 @@ async def get_worklogs(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="debug", auth_level=func.AuthLevel.ANONYMOUS)
 def debug(req: func.HttpRequest) -> func.HttpResponse:
-    import requests
-    JIRA_EMAIL, JIRA_API_TOKEN = get_credentials()
+    try:
+        import requests
+        JIRA_EMAIL, JIRA_API_TOKEN = get_credentials()
+        
+        resp1 = requests.get(
+            f"{JIRA_BASE_URL}/rest/api/3/myself",
+            auth=(JIRA_EMAIL, JIRA_API_TOKEN),
+            timeout=10
+        )
+        auth_status = resp1.status_code
+        auth_body = resp1.text[:300]
+        
+    except Exception as e:
+        return func.HttpResponse(
+            f"CRASHED at Jira auth: {str(e)}",
+            mimetype="text/plain"
+        )
     
-    # Test 1: Jira auth
-    resp1 = requests.get(
-        f"{JIRA_BASE_URL}/rest/api/3/myself",
-        auth=(JIRA_EMAIL, JIRA_API_TOKEN)
-    )
-    
-    # Test 2: JQL search
-    jql = "project IN (CARE) AND worklogDate >= '2026-01-01' AND worklogDate <= '2026-02-28'"
-    resp2 = requests.get(
-        f"{JIRA_BASE_URL}/rest/api/3/search/jql?jql={jql}&maxResults=1",
-        auth=(JIRA_EMAIL, JIRA_API_TOKEN)
-    )
+    try:
+        jql = "project IN (CARE) AND worklogDate >= '2026-01-01' AND worklogDate <= '2026-02-28'"
+        resp2 = requests.get(
+            f"{JIRA_BASE_URL}/rest/api/3/search/jql?jql={jql}&maxResults=1",
+            auth=(JIRA_EMAIL, JIRA_API_TOKEN),
+            timeout=10
+        )
+        search_status = resp2.status_code
+        search_body = resp2.text[:300]
+        
+    except Exception as e:
+        return func.HttpResponse(
+            f"Auth OK ({auth_status})\nCRASHED at JQL search: {str(e)}",
+            mimetype="text/plain"
+        )
     
     return func.HttpResponse(
-        f"Auth status: {resp1.status_code}\n"
-        f"Me: {resp1.json().get('displayName', 'unknown')}\n\n"
-        f"Search status: {resp2.status_code}\n"
-        f"Total issues: {resp2.json().get('total', resp2.text[:200])}",
+        f"Auth status: {auth_status}\nAuth body: {auth_body}\n\n"
+        f"Search status: {search_status}\nSearch body: {search_body}",
         mimetype="text/plain"
     )
 @app.route(route="ping", auth_level=func.AuthLevel.ANONYMOUS)
