@@ -305,3 +305,24 @@ def debug(req: func.HttpRequest) -> func.HttpResponse:
         f"Total issues: {resp2.json().get('total', resp2.text[:200])}",
         mimetype="text/plain"
     )
+@app.route(route="ping", auth_level=func.AuthLevel.ANONYMOUS)
+def ping(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        import requests
+        req_ok = "OK"
+    except:
+        req_ok = "MISSING"
+    try:
+        import aiohttp
+        aio_ok = "OK"
+    except:
+        aio_ok = "MISSING"
+    try:
+        import pandas
+        pd_ok = "OK"
+    except:
+        pd_ok = "MISSING"
+    return func.HttpResponse(
+        f"requests: {req_ok}\naiohttp: {aio_ok}\npandas: {pd_ok}",
+        mimetype="text/plain"
+    )
