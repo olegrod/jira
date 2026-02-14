@@ -96,31 +96,43 @@ async def fetch_json(session, url):
 async def get_all_issues(session, projects, start_date, end_date):
     projects_str = ",".join(projects)
     jql = f"project IN ({projects_str}) AND worklogDate >= '{start_date}' AND worklogDate <= '{end_date}'"
-    jql_encoded = quote(jql)
     issues = []
-    start_at = 0
+    next_page_token = None
 
     while True:
-        url = (
-            f"{JIRA_BASE_URL}/rest/api/3/search"
-            f"?jql={jql_encoded}"
-            f"&fields=project,summary,parent,issuetype,customfield_10485"
-            f"&maxResults=100"
-            f"&startAt={start_at}"
-        )
-        data = await fetch_json(session, url)
-        if not data or "issues" not in data:
+        payload = {
+            "jql": jql,
+            "fields": ["project", "summary", "parent", "issuetype", "customfield_10485"],
+            "maxResults": 100
+        }
+        if next_page_token:
+            payload["nextPageToken"] = next_page_token
+
+        url = f"{JIRA_BASE_URL}/rest/api/3/search/jql"
+        try:
+            async with session.post(
+                url,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                if resp.status != 200:
+                    break
+                data = await resp.json()
+        except Exception:
             break
-        batch = data["issues"]
+
+        batch = data.get("issues", [])
         if not batch:
             break
         issues.extend(batch)
-        total = data.get("total", 0)
-        start_at += len(batch)
-        if start_at >= total:
+
+        # POST-based pagination works correctly unlike GET
+        next_page_token = data.get("nextPageToken")
+        if not next_page_token or data.get("isLast", False):
             break
 
     return issues
+
 
 # FIX: worklog pagination — maxResults=5000 is too high, Jira caps at 100 per page
 async def fetch_issue_worklogs(session, issue_key, semaphore):
@@ -351,33 +363,20 @@ def debug(req: func.HttpRequest) -> func.HttpResponse:
         import requests
         JIRA_EMAIL, JIRA_API_TOKEN = get_credentials()
 
-        resp1 = requests.get(
-            f"{JIRA_BASE_URL}/rest/api/3/myself",
+        payload = {
+            "jql": "project IN (CARE) AND worklogDate >= '2026-01-01' AND worklogDate <= '2026-02-28'",
+            "fields": ["summary"],
+            "maxResults": 1
+        }
+        resp = requests.post(
+            f"{JIRA_BASE_URL}/rest/api/3/search/jql",
             auth=(JIRA_EMAIL, JIRA_API_TOKEN),
+            json=payload,
             timeout=10
         )
-        auth_status = resp1.status_code
-        auth_body = resp1.text[:300]
-    except Exception as e:
-        return func.HttpResponse(f"CRASHED at Jira auth: {str(e)}", mimetype="text/plain")
-
-    try:
-        jql = quote("project IN (CARE) AND worklogDate >= '2026-01-01' AND worklogDate <= '2026-02-28'")
-        resp2 = requests.get(
-            f"{JIRA_BASE_URL}/rest/api/3/search?jql={jql}&maxResults=1",
-            auth=(JIRA_EMAIL, JIRA_API_TOKEN),
-            timeout=10
-        )
-        search_status = resp2.status_code
-        search_body = resp2.text[:300]
-    except Exception as e:
         return func.HttpResponse(
-            f"Auth OK ({auth_status})\nCRASHED at JQL search: {str(e)}",
+            f"Status: {resp.status_code}\nBody: {resp.text[:500]}",
             mimetype="text/plain"
         )
-
-    return func.HttpResponse(
-        f"Auth status: {auth_status}\nAuth body: {auth_body}\n\n"
-        f"Search status: {search_status}\nSearch body: {search_body}",
-        mimetype="text/plain"
-    )
+    except Exception as e:
+        return func.HttpResponse(f"CRASHED: {str(e)}", mimetype="text/plain")
