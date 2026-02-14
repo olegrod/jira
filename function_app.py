@@ -279,3 +279,12 @@ async def get_worklogs(req: func.HttpRequest) -> func.HttpResponse:
         df.to_json(orient='records', date_format='iso'),
         mimetype="application/json"
     )
+
+@app.route(route="debug", auth_level=func.AuthLevel.ANONYMOUS)
+def debug(req: func.HttpRequest) -> func.HttpResponse:
+    email = os.environ.get("JIRA_EMAIL", "NOT SET")
+    token = os.environ.get("JIRA_API_TOKEN", "NOT SET")
+    return func.HttpResponse(
+        f"EMAIL: {email[:20]}... TOKEN: {token[:10]}...",
+        mimetype="text/plain"
+    )
