@@ -151,7 +151,7 @@ async def get_epic_info(session, parent_key, issue_type, cache, semaphore):
         return cache[cache_key]
 
     async with semaphore:
-        if issue_type in ("Story", "Task", "Triage Task", "Tech Enabler", "Bug", "Solution", "Defect", "Change","Implementation"):
+        if issue_type in ("Story", "Task", "Triage Task", "Tech Enabler", "Bug", "Solution", "Defect", "Change","Implementation","Test"):
             url = f"{JIRA_BASE_URL}/rest/api/3/issue/{parent_key}?fields=summary,issuetype,customfield_10485"
             parent_data = await fetch_json(session, url)
             if not parent_data:
