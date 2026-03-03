@@ -344,7 +344,7 @@ def debug(req: func.HttpRequest) -> func.HttpResponse:
 
         # Step 1: search
         payload = {
-            "jql": "project IN (CARE) AND worklogDate >= '2026-01-01' AND worklogDate <= '2026-02-28'",
+            "jql": "project IN (CARE) AND worklogDate >= '2026-01-01' AND worklogDate <= '2026-03-31'",
             "fields": ["summary", "project", "parent", "issuetype"],
             "maxResults": 1
         }
