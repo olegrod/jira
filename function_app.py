@@ -100,7 +100,7 @@ async def get_all_issues(session, projects, start_date, end_date):
     while True:
         payload = {
             "jql": jql,
-            "fields": ["project", "summary", "parent", "issuetype", "customfield_10485"],
+            "fields": ["project", "summary", "parent", "issuetype", "customfield_10485", "customfield_10001"],
             "maxResults": 100
         }
         if next_page_token:
@@ -255,6 +255,8 @@ async def fetch_worklogs_async(projects, start_date, end_date):
             project = fields.get("project", {})
             parent = fields.get("parent")
             issue_type_name = fields.get("issuetype", {}).get("name")
+            team = fields.get("customfield_10001")
+            team_name = team.get("name") if isinstance(team, dict) else None
 
             epic_info = None
             if issue_type_name == "Epic":
@@ -284,6 +286,7 @@ async def fetch_worklogs_async(projects, start_date, end_date):
                     "Issue_Key": issue["key"],
                     "Issue_Name": fields.get("summary"),
                     "Issue_Type": issue_type_name,
+                    "Team": team_name,
                     "Project_Key": project.get("key"),
                     "Project_Name": project.get("name"),
                     "Epic_Key": epic_info["Epic_Key"] if epic_info else None,
