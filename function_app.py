@@ -379,3 +379,96 @@ def debug(req: func.HttpRequest) -> func.HttpResponse:
         )
     except Exception as e:
         return func.HttpResponse(f"CRASHED: {str(e)}", mimetype="text/plain")
+@app.route(route="issues", auth_level=func.AuthLevel.ANONYMOUS)
+async def get_issues(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        projects = req.params.get('projects', 'CARE,UMVISION,PFORM,POP,OPS,ENG,CHANGE,AFNDRY')
+        projects_list = [p.strip() for p in projects.split(',')]
+        projects_str = ",".join(projects_list)
+        
+        JIRA_EMAIL, JIRA_API_TOKEN = get_credentials()
+        auth_string = base64.b64encode(f"{JIRA_EMAIL}:{JIRA_API_TOKEN}".encode()).decode()
+        headers = {
+            "Authorization": f"Basic {auth_string}",
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+        
+        jql = f"project IN ({projects_str}) AND issuetype IN (Epic, Feature, Story, Solution, Task, 'Tech Enabler', 'Triage Task') AND created >= '2024-01-01'"
+        issues = []
+        next_page_token = None
+        
+        async with aiohttp.ClientSession(headers=headers) as session:
+            while True:
+                payload = {
+                    "jql": jql,
+                    "fields": ["project", "summary", "parent", "issuetype", "customfield_10485", "customfield_10001", "status", "created", "updated", "resolutiondate"],
+                    "maxResults": 100
+                }
+                if next_page_token:
+                    payload["nextPageToken"] = next_page_token
+                
+                async with session.post(
+                    f"{JIRA_BASE_URL}/rest/api/3/search/jql",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=60)
+                ) as resp:
+                    if resp.status != 200:
+                        break
+                    data = await resp.json()
+                
+                batch = data.get("issues", [])
+                if not batch:
+                    break
+                issues.extend(batch)
+                next_page_token = data.get("nextPageToken")
+                if not next_page_token or data.get("isLast", False):
+                    break
+        
+        # Build rows
+        rows = []
+        for issue in issues:
+            fields = issue.get("fields", {})
+            project = fields.get("project", {})
+            parent = fields.get("parent")
+            issue_type_name = fields.get("issuetype", {}).get("name")
+            team = fields.get("customfield_10001")
+            team_name = team.get("name") if isinstance(team, dict) else None
+            goals_list = fields.get("customfield_10485") or []
+            
+            rows.append({
+                "Issue_Key": issue["key"],
+                "Issue_Name": fields.get("summary"),
+                "Issue_Type": issue_type_name,
+                "Team": team_name,
+                "Project_Key": project.get("key"),
+                "Project_Name": project.get("name"),
+                "Status": fields.get("status", {}).get("name"),
+                "Created_Date": fields.get("created"),
+                "Updated_Date": fields.get("updated"),
+                "Resolved_Date": fields.get("resolutiondate"),
+                "Parent_Key": parent.get("key") if parent else None,
+                "Goal_ARI": goals_list[0].get("id") if goals_list else None
+            })
+        
+        df = pd.DataFrame(rows)
+        
+        # Join goals
+        goals_df = fetch_goals()
+        if not df.empty and not goals_df.empty:
+            df = df.merge(goals_df[["Goal_ARI", "Goal_Key", "Goal_Name_Lookup"]], on="Goal_ARI", how="left")
+            df.rename(columns={"Goal_Name_Lookup": "Goal"}, inplace=True)
+        else:
+            df["Goal_Key"] = None
+            df["Goal"] = None
+        
+        return func.HttpResponse(
+            df.to_json(orient='records', date_format='iso'),
+            mimetype="application/json"
+        )
+    except Exception as e:
+        return func.HttpResponse(
+            json.dumps({"error": str(e)}),
+            mimetype="application/json",
+            status_code=500
+        )
