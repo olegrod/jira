@@ -4,9 +4,9 @@ import base64
 import asyncio
 import aiohttp
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, date, timedelta
 import json
-from urllib.parse import quote
+import calendar
 
 app = func.FunctionApp()
 
@@ -14,7 +14,10 @@ app = func.FunctionApp()
 JIRA_BASE_URL = "https://aerialproduct.atlassian.net"
 JIRA_DOMAIN = "aerialproduct.atlassian.net"
 CONTAINER_ID = "ari:cloud:townsquare::site/11b5321b-ff75-4f9e-b925-34136a9fc3a3"
-MAX_CONCURRENT = 40
+MAX_CONCURRENT = 30
+MAX_RETRIES = 3
+RETRY_DELAY = 2.0
+
 
 def get_credentials():
     return (
@@ -22,8 +25,8 @@ def get_credentials():
         os.environ.get("JIRA_API_TOKEN")
     )
 
+
 # === GOALS FETCH ===
-# Uses GraphQL — no change needed here, this works correctly
 def fetch_goals():
     import requests
     JIRA_EMAIL, JIRA_API_TOKEN = get_credentials()
@@ -47,26 +50,19 @@ def fetch_goals():
                 searchString: ""
                 first: 100{after_clause}
             ) {{
-                pageInfo {{
-                    hasNextPage
-                    endCursor
-                }}
+                pageInfo {{ hasNextPage endCursor }}
                 edges {{
-                    node {{
-                        id
-                        key
-                        name
-                    }}
+                    node {{ id key name }}
                 }}
             }}
         }}
         """
-        response = requests.post(graphql_url, headers=headers, json={"query": query}, timeout=30)
+        response = requests.post(
+            graphql_url, headers=headers, json={"query": query}, timeout=30
+        )
         result = response.json()
-
         if "errors" in result or "data" not in result:
             break
-
         search_result = result["data"]["goals_search"]
         for edge in search_result["edges"]:
             goal = edge["node"]
@@ -75,45 +71,76 @@ def fetch_goals():
                 "Goal_Key": goal["key"],
                 "Goal_Name_Lookup": goal["name"]
             })
-
         has_next_page = search_result["pageInfo"]["hasNextPage"]
         cursor = search_result["pageInfo"].get("endCursor")
 
     return pd.DataFrame(all_goals)
 
-# === JIRA ASYNC FUNCTIONS ===
-async def fetch_json(session, url):
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-            if resp.status == 200:
-                return await resp.json()
-    except Exception:
-        pass
+
+# === ASYNC HELPERS ===
+
+async def fetch_json(session, url, retries=MAX_RETRIES):
+    """GET with exponential backoff retry. Returns None on permanent failure."""
+    for attempt in range(retries):
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                if resp.status == 429:
+                    retry_after = float(resp.headers.get("Retry-After", RETRY_DELAY * (attempt + 1)))
+                    await asyncio.sleep(retry_after)
+                    continue
+                if resp.status >= 500:
+                    await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+                    continue
+                return None
+        except asyncio.TimeoutError:
+            await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+        except Exception:
+            await asyncio.sleep(RETRY_DELAY * (attempt + 1))
     return None
+
 
 async def get_all_issues(session, projects, start_date, end_date):
     projects_str = ",".join(projects)
-    jql = f"project IN ({projects_str}) AND worklogDate >= '{start_date}' AND worklogDate <= '{end_date}'"
+    jql = (
+        f"project IN ({projects_str}) "
+        f"AND worklogDate >= '{start_date}' "
+        f"AND worklogDate <= '{end_date}'"
+    )
     issues = []
     next_page_token = None
 
     while True:
         payload = {
             "jql": jql,
-            "fields": ["project", "summary", "parent", "issuetype", "customfield_10485", "customfield_10001"],
-            "maxResults": 100
+            "fields": [
+                "project", "summary", "parent", "issuetype",
+                "customfield_10485", "customfield_10001"
+            ],
+            "maxResults": 1000
         }
         if next_page_token:
             payload["nextPageToken"] = next_page_token
 
-        async with session.post(
-            f"{JIRA_BASE_URL}/rest/api/3/search/jql",
-            json=payload,
-            timeout=aiohttp.ClientTimeout(total=30)
-        ) as resp:
-            if resp.status != 200:
-                break
-            data = await resp.json()
+        for attempt in range(MAX_RETRIES):
+            try:
+                async with session.post(
+                    f"{JIRA_BASE_URL}/rest/api/3/search/jql",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=60)
+                ) as resp:
+                    if resp.status == 429:
+                        await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+                        continue
+                    if resp.status != 200:
+                        return issues
+                    data = await resp.json()
+                    break
+            except Exception:
+                await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+        else:
+            break
 
         batch = data.get("issues", [])
         if not batch:
@@ -126,180 +153,281 @@ async def get_all_issues(session, projects, start_date, end_date):
     return issues
 
 
-# FIX: worklog pagination — maxResults=5000 is too high, Jira caps at 100 per page
+async def fetch_all_epics(session, projects):
+    """
+    Fetch ALL epics for the given projects in a single paginated JQL query.
+    Returns a dict keyed by Epic_Key -> {Epic_Key, Epic_Name, Goal_ARI}.
+    Called once before month chunks and reused across all of them.
+    """
+    projects_str = ",".join(projects)
+    jql = f"project IN ({projects_str}) AND issuetype = Epic"
+    epics = {}
+    next_page_token = None
+
+    while True:
+        payload = {
+            "jql": jql,
+            "fields": ["summary", "customfield_10485"],
+            "maxResults": 1000
+        }
+        if next_page_token:
+            payload["nextPageToken"] = next_page_token
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                async with session.post(
+                    f"{JIRA_BASE_URL}/rest/api/3/search/jql",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=60)
+                ) as resp:
+                    if resp.status == 429:
+                        await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+                        continue
+                    if resp.status != 200:
+                        return epics
+                    data = await resp.json()
+                    break
+            except Exception:
+                await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+        else:
+            break
+
+        for issue in data.get("issues", []):
+            fields = issue.get("fields", {})
+            goals_list = fields.get("customfield_10485") or []
+            epics[issue["key"]] = {
+                "Epic_Key": issue["key"],
+                "Epic_Name": fields.get("summary"),
+                "Goal_ARI": goals_list[0].get("id") if goals_list else None
+            }
+
+        next_page_token = data.get("nextPageToken")
+        if not next_page_token or data.get("isLast", False):
+            break
+
+    return epics
+
+
 async def fetch_issue_worklogs(session, issue_key, semaphore):
+    """
+    Fetch first page to get total, then fetch remaining pages in parallel.
+    Returns flat list of all worklog dicts.
+    """
     async with semaphore:
-        worklogs = []
-        start_at = 0
-        while True:
-            url = f"{JIRA_BASE_URL}/rest/api/3/issue/{issue_key}/worklog?maxResults=100&startAt={start_at}"
-            data = await fetch_json(session, url)
-            if not data or "worklogs" not in data:
-                break
-            batch = data["worklogs"]
-            worklogs.extend(batch)
-            total = data.get("total", 0)
-            start_at += len(batch)
-            if start_at >= total:
-                break
+        first_url = f"{JIRA_BASE_URL}/rest/api/3/issue/{issue_key}/worklog?maxResults=100&startAt=0"
+        first = await fetch_json(session, first_url)
+        if not first or "worklogs" not in first:
+            return []
+
+        worklogs = list(first["worklogs"])
+        total = first.get("total", 0)
+
+        if total <= 100:
+            return worklogs
+
+        offsets = range(100, total, 100)
+        tasks = [
+            fetch_json(
+                session,
+                f"{JIRA_BASE_URL}/rest/api/3/issue/{issue_key}/worklog?maxResults=100&startAt={offset}"
+            )
+            for offset in offsets
+        ]
+        pages = await asyncio.gather(*tasks)
+        for page in pages:
+            if page and "worklogs" in page:
+                worklogs.extend(page["worklogs"])
+
         return worklogs
 
-# No changes needed in get_epic_info — uses single issue fetch, correct endpoint
-async def get_epic_info(session, parent_key, issue_type, cache, semaphore):
-    cache_key = f"{parent_key}_{issue_type}"
-    if cache_key in cache:
-        return cache[cache_key]
+
+async def resolve_subtask_epic(session, parent_key, epic_dict, semaphore, subtask_cache):
+    """
+    For a sub-task: fetch its immediate parent to get the grandparent key,
+    then look up the grandparent in the pre-loaded epic_dict.
+    Results cached in subtask_cache to avoid duplicate calls for shared parents.
+    """
+    if parent_key in subtask_cache:
+        return subtask_cache[parent_key]
 
     async with semaphore:
-        if issue_type in ("Story", "Task", "Triage Task", "Tech Enabler", "Bug", "Solution", "Defect", "Change","Implementation","Test"):
-            url = f"{JIRA_BASE_URL}/rest/api/3/issue/{parent_key}?fields=summary,issuetype,customfield_10485"
-            parent_data = await fetch_json(session, url)
-            if not parent_data:
-                cache[cache_key] = None
-                return None
-            parent_fields = parent_data.get("fields", {})
-            parent_type = parent_fields.get("issuetype", {}).get("name", "")
+        url = f"{JIRA_BASE_URL}/rest/api/3/issue/{parent_key}?fields=parent"
+        parent_data = await fetch_json(session, url)
 
-            if parent_type != "Epic":
-                cache[cache_key] = None
-                return None
-
-            goals_list = parent_fields.get("customfield_10485") or []
-            result = {
-                "Epic_Key": parent_key,
-                "Epic_Name": parent_fields.get("summary"),
-                "Goal_ARI": goals_list[0].get("id") if goals_list else None
-            }
-            cache[cache_key] = result
-            return result
-
-        if issue_type == "Sub-task":
-            url = f"{JIRA_BASE_URL}/rest/api/3/issue/{parent_key}?fields=parent"
-            parent_data = await fetch_json(session, url)
-            if not parent_data:
-                cache[cache_key] = None
-                return None
-
-            grandparent = parent_data.get("fields", {}).get("parent")
-            if not grandparent:
-                cache[cache_key] = None
-                return None
-
+    result = None
+    if parent_data:
+        grandparent = parent_data.get("fields", {}).get("parent")
+        if grandparent:
             grandparent_key = grandparent.get("key")
-            epic_url = f"{JIRA_BASE_URL}/rest/api/3/issue/{grandparent_key}?fields=summary,issuetype,customfield_10485"
-            epic_data = await fetch_json(session, epic_url)
-            if not epic_data:
-                cache[cache_key] = None
-                return None
+            result = epic_dict.get(grandparent_key)  # look up in pre-loaded epics
 
-            epic_fields = epic_data.get("fields", {})
-            epic_type = epic_fields.get("issuetype", {}).get("name", "")
+    subtask_cache[parent_key] = result
+    return result
 
-            if epic_type != "Epic":
-                cache[cache_key] = None
-                return None
 
-            goals_list = epic_fields.get("customfield_10485") or []
-            result = {
-                "Epic_Key": grandparent_key,
-                "Epic_Name": epic_fields.get("summary"),
-                "Goal_ARI": goals_list[0].get("id") if goals_list else None
-            }
-            cache[cache_key] = result
-            return result
+async def fetch_worklogs_for_range(session, projects, start_date, end_date, epic_dict):
+    """
+    Fetch worklogs for a single date range chunk.
+    epic_dict is pre-loaded and shared across all chunks.
+    Returns DataFrame.
+    """
+    filter_start = datetime.strptime(start_date, "%Y-%m-%d").date()
+    filter_end = datetime.strptime(end_date, "%Y-%m-%d").date()
 
-        cache[cache_key] = None
-        return None
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+    subtask_cache = {}  # cache for sub-task intermediate parent lookups
+
+    issues = await get_all_issues(session, projects, start_date, end_date)
+    if not issues:
+        return pd.DataFrame()
+
+    # 1. Fetch all worklogs in parallel
+    worklog_tasks = [
+        fetch_issue_worklogs(session, issue["key"], semaphore)
+        for issue in issues
+    ]
+    all_worklogs = await asyncio.gather(*worklog_tasks)
+    issue_worklogs = dict(zip([i["key"] for i in issues], all_worklogs))
+
+    # 2. Resolve sub-task parents — use issues dataset first, API only for misses
+    issues_by_key = {i["key"]: i for i in issues}
+
+    subtask_parent_keys = set()
+    for issue in issues:
+        fields = issue.get("fields", {})
+        if fields.get("issuetype", {}).get("name") == "Sub-task":
+            parent = fields.get("parent")
+            if not parent:
+                continue
+            parent_key = parent["key"]
+            # If intermediate parent is already in our issues dataset,
+            # pre-populate subtask_cache from it — no API call needed
+            if parent_key in issues_by_key:
+                grandparent = issues_by_key[parent_key].get("fields", {}).get("parent")
+                if grandparent:
+                    subtask_cache[parent_key] = epic_dict.get(grandparent["key"])
+                else:
+                    subtask_cache[parent_key] = None
+            else:
+                subtask_parent_keys.add(parent_key)
+
+    # print(f"[{start_date}→{end_date}] Issues: {len(issues)}, Sub-task parents: {len(subtask_parent_keys)} API calls (rest resolved from dataset)")                
+    
+    if subtask_parent_keys:
+        await asyncio.gather(*[
+            resolve_subtask_epic(session, pk, epic_dict, semaphore, subtask_cache)
+            for pk in subtask_parent_keys
+        ])
+    # subtask_cache is now fully populated
+
+    # 3. Build rows
+    rows = []
+    for issue in issues:
+        fields = issue.get("fields", {})
+        project = fields.get("project", {})
+        parent = fields.get("parent")
+        issue_type_name = fields.get("issuetype", {}).get("name")
+        team = fields.get("customfield_10001")
+        team_name = team.get("name") if isinstance(team, dict) else None
+
+        # Resolve epic_info from pre-loaded dict
+        if issue_type_name == "Epic":
+            # Epic logs time against itself
+            epic_info = epic_dict.get(issue["key"])
+        elif issue_type_name == "Sub-task":
+            # Sub-task: resolve via subtask_cache (grandparent lookup)
+            epic_info = subtask_cache.get(parent["key"]) if parent else None
+        elif parent:
+            # Story/Task/Bug/etc: parent should be Epic — look up directly
+            epic_info = epic_dict.get(parent["key"])
+        else:
+            epic_info = None
+
+        for wl in issue_worklogs.get(issue["key"], []):
+            started_str = wl.get("started", "")
+            try:
+                started_dt = datetime.fromisoformat(started_str.replace("Z", "+00:00"))
+                logged_date = started_dt.date()
+            except Exception:
+                continue
+            if not (filter_start <= logged_date <= filter_end):
+                continue
+
+            author = wl.get("author", {})
+            rows.append({
+                "Issue_Key": issue["key"],
+                "Issue_Name": fields.get("summary"),
+                "Issue_Type": issue_type_name,
+                "Team": team_name,
+                "Project_Key": project.get("key"),
+                "Project_Name": project.get("name"),
+                "Epic_Key": epic_info["Epic_Key"] if epic_info else None,
+                "Epic_Name": epic_info["Epic_Name"] if epic_info else None,
+                "Goal_ARI": epic_info["Goal_ARI"] if epic_info else None,
+                "User_Name": author.get("displayName"),
+                "started": started_dt.isoformat(),
+                "Logged_Date": logged_date.isoformat(),
+                "Logged_Hours": round(wl.get("timeSpentSeconds", 0) / 3600, 2)
+            })
+
+    return pd.DataFrame(rows)
+
+
+def split_into_months(start_date: str, end_date: str):
+    """Split a date range into monthly chunks. Returns list of (start, end) strings."""
+    start = datetime.strptime(start_date, "%Y-%m-%d").date()
+    end = datetime.strptime(end_date, "%Y-%m-%d").date()
+    chunks = []
+    current = start
+    while current <= end:
+        last_day = date(
+            current.year,
+            current.month,
+            calendar.monthrange(current.year, current.month)[1]
+        )
+        chunk_end = min(last_day, end)
+        chunks.append((current.isoformat(), chunk_end.isoformat()))
+        current = chunk_end + timedelta(days=1)
+    return chunks
+
 
 async def fetch_worklogs_async(projects, start_date, end_date):
     JIRA_EMAIL, JIRA_API_TOKEN = get_credentials()
-    filter_start = datetime.strptime(start_date, "%Y-%m-%d").date()
-    filter_end = datetime.strptime(end_date, "%Y-%m-%d").date()
-    
-    # Build auth header once for all requests
     auth_string = base64.b64encode(f"{JIRA_EMAIL}:{JIRA_API_TOKEN}".encode()).decode()
-    default_headers = {
+    headers = {
         "Authorization": f"Basic {auth_string}",
         "Content-Type": "application/json",
         "Accept": "application/json"
     }
-    
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-    epic_cache = {}
 
-    # No auth= in session — use headers instead everywhere
-    async with aiohttp.ClientSession(headers=default_headers) as session:
-        issues = await get_all_issues(session, projects, start_date, end_date)
-        if not issues:
-            return pd.DataFrame()
+    date_chunks = split_into_months(start_date, end_date)
 
-        worklog_tasks = [fetch_issue_worklogs(session, issue["key"], semaphore) for issue in issues]
-        all_worklogs = await asyncio.gather(*worklog_tasks)
-        issue_worklogs = dict(zip([i["key"] for i in issues], all_worklogs))
+    async with aiohttp.ClientSession(headers=headers) as session:
+        # Fetch goals and epics once, before any month chunks
+        goals_df = fetch_goals()
+        epic_dict = await fetch_all_epics(session, projects)
 
-        epic_tasks = [
-            get_epic_info(
-                session,
-                issue.get("fields", {}).get("parent", {}).get("key"),
-                issue.get("fields", {}).get("issuetype", {}).get("name"),
-                epic_cache,
-                semaphore
-            )
-            for issue in issues if issue.get("fields", {}).get("parent")
+        # Process months sequentially to stay within Azure timeout budget
+        all_frames = []
+        chunk_semaphore = asyncio.Semaphore(3)
+
+        async def fetch_chunk_limited(sem, session, projects, chunk_start, chunk_end, epic_dict):
+            async with sem:
+                return await fetch_worklogs_for_range(session, projects, chunk_start, chunk_end, epic_dict)
+
+        tasks = [
+            fetch_chunk_limited(chunk_semaphore, session, projects, s, e, epic_dict)
+            for s, e in date_chunks
         ]
-        await asyncio.gather(*epic_tasks)
+        all_frames = [df for df in await asyncio.gather(*tasks) if not df.empty]
 
-        rows = []
-        for issue in issues:
-            fields = issue.get("fields", {})
-            project = fields.get("project", {})
-            parent = fields.get("parent")
-            issue_type_name = fields.get("issuetype", {}).get("name")
-            team = fields.get("customfield_10001")
-            team_name = team.get("name") if isinstance(team, dict) else None
+    if not all_frames:
+        return pd.DataFrame(), goals_df
 
-            epic_info = None
-            if issue_type_name == "Epic":
-                goals_list = fields.get("customfield_10485") or []
-                epic_info = {
-                    "Epic_Key": issue["key"],
-                    "Epic_Name": fields.get("summary"),
-                    "Goal_ARI": goals_list[0].get("id") if goals_list else None
-                }
-            elif parent:
-                cache_key = f"{parent['key']}_{issue_type_name}"
-                epic_info = epic_cache.get(cache_key)
+    return pd.concat(all_frames, ignore_index=True), goals_df
 
-            for wl in issue_worklogs.get(issue["key"], []):
-                started_str = wl.get("started", "")
-                try:
-                    started_dt = datetime.fromisoformat(started_str.replace("Z", "+00:00"))
-                    logged_date = started_dt.date()
-                except Exception:
-                    continue
-                if not (filter_start <= logged_date <= filter_end):
-                    continue
 
-                time_spent_seconds = wl.get("timeSpentSeconds", 0)
-                author = wl.get("author", {})
-                rows.append({
-                    "Issue_Key": issue["key"],
-                    "Issue_Name": fields.get("summary"),
-                    "Issue_Type": issue_type_name,
-                    "Team": team_name,
-                    "Project_Key": project.get("key"),
-                    "Project_Name": project.get("name"),
-                    "Epic_Key": epic_info["Epic_Key"] if epic_info else None,
-                    "Epic_Name": epic_info["Epic_Name"] if epic_info else None,
-                    "Goal_ARI": epic_info["Goal_ARI"] if epic_info else None,
-                    "User_Name": author.get("displayName"),
-                    "started": started_dt.isoformat(),
-                    "Logged_Date": logged_date.isoformat(),
-                    "Logged_Hours": round(time_spent_seconds / 3600, 2)
-                })
-
-        return pd.DataFrame(rows)
-
+# === HTTP ENDPOINTS ===
 
 @app.route(route="worklogs", auth_level=func.AuthLevel.ANONYMOUS)
 async def get_worklogs(req: func.HttpRequest) -> func.HttpResponse:
@@ -307,19 +435,19 @@ async def get_worklogs(req: func.HttpRequest) -> func.HttpResponse:
         projects = req.params.get('projects', 'CARE,UMVISION,PFORM,POP,OPS,ENG,CHANGE,AFNDRY')
         start_date = req.params.get('start_date', '2026-01-01')
         end_date = req.params.get('end_date', '2026-02-28')
-
         projects_list = [p.strip() for p in projects.split(',')]
 
-        goals_df = fetch_goals()
-        df = await fetch_worklogs_async(projects_list, start_date, end_date)
+        df, goals_df = await fetch_worklogs_async(projects_list, start_date, end_date)
 
         if not df.empty and not goals_df.empty:
-            df = df.merge(goals_df[["Goal_ARI", "Goal_Key", "Goal_Name_Lookup"]], on="Goal_ARI", how="left")
+            df = df.merge(
+                goals_df[["Goal_ARI", "Goal_Key", "Goal_Name_Lookup"]],
+                on="Goal_ARI", how="left"
+            )
             df.rename(columns={"Goal_Name_Lookup": "Goal"}, inplace=True)
-        else:
-            # FIX: safe empty DataFrame handling
+        elif df.empty:
             df = pd.DataFrame(columns=[
-                "Issue_Key", "Issue_Name", "Issue_Type",
+                "Issue_Key", "Issue_Name", "Issue_Type", "Team",
                 "Project_Key", "Project_Name",
                 "Epic_Key", "Epic_Name",
                 "Goal_ARI", "Goal_Key", "Goal",
@@ -338,14 +466,11 @@ async def get_worklogs(req: func.HttpRequest) -> func.HttpResponse:
         )
 
 
-
 @app.route(route="debug", auth_level=func.AuthLevel.ANONYMOUS)
 def debug(req: func.HttpRequest) -> func.HttpResponse:
     try:
         import requests
         JIRA_EMAIL, JIRA_API_TOKEN = get_credentials()
-
-        # Step 1: search
         payload = {
             "jql": "project IN (CARE) AND worklogDate >= '2026-01-01' AND worklogDate <= '2026-03-31'",
             "fields": ["summary", "project", "parent", "issuetype"],
@@ -354,23 +479,19 @@ def debug(req: func.HttpRequest) -> func.HttpResponse:
         resp = requests.post(
             f"{JIRA_BASE_URL}/rest/api/3/search/jql",
             auth=(JIRA_EMAIL, JIRA_API_TOKEN),
-            json=payload,
-            timeout=10
+            json=payload, timeout=10
         )
         data = resp.json()
         issues = data.get("issues", [])
         if not issues:
-            return func.HttpResponse(f"Search OK but no issues\n{resp.text[:300]}", mimetype="text/plain")
-
+            return func.HttpResponse(
+                f"Search OK but no issues\n{resp.text[:300]}", mimetype="text/plain"
+            )
         issue_key = issues[0]["key"]
-
-        # Step 2: fetch worklogs for that issue
         resp2 = requests.get(
             f"{JIRA_BASE_URL}/rest/api/3/issue/{issue_key}/worklog?maxResults=5&startAt=0",
-            auth=(JIRA_EMAIL, JIRA_API_TOKEN),
-            timeout=10
+            auth=(JIRA_EMAIL, JIRA_API_TOKEN), timeout=10
         )
-
         return func.HttpResponse(
             f"Issue: {issue_key}\n"
             f"Worklog status: {resp2.status_code}\n"
@@ -379,13 +500,15 @@ def debug(req: func.HttpRequest) -> func.HttpResponse:
         )
     except Exception as e:
         return func.HttpResponse(f"CRASHED: {str(e)}", mimetype="text/plain")
+
+
 @app.route(route="issues", auth_level=func.AuthLevel.ANONYMOUS)
 async def get_issues(req: func.HttpRequest) -> func.HttpResponse:
     try:
         projects = req.params.get('projects', 'CARE,UMVISION,PFORM,POP,OPS,ENG,CHANGE,AFNDRY')
         projects_list = [p.strip() for p in projects.split(',')]
         projects_str = ",".join(projects_list)
-        
+
         JIRA_EMAIL, JIRA_API_TOKEN = get_credentials()
         auth_string = base64.b64encode(f"{JIRA_EMAIL}:{JIRA_API_TOKEN}".encode()).decode()
         headers = {
@@ -393,30 +516,45 @@ async def get_issues(req: func.HttpRequest) -> func.HttpResponse:
             "Content-Type": "application/json",
             "Accept": "application/json"
         }
-        
-        jql = f"project IN ({projects_str}) AND issuetype IN (Epic, Feature, Story, Solution, Task, 'Tech Enabler', 'Triage Task') AND created >= '2024-01-01'"
+
+        jql = (
+            f"project IN ({projects_str}) "
+            f"AND issuetype IN (Epic, Feature, Story, Solution, Task, 'Tech Enabler', 'Triage Task') "
+            f"AND created >= '2024-01-01'"
+        )
         issues = []
         next_page_token = None
-        
+
         async with aiohttp.ClientSession(headers=headers) as session:
             while True:
                 payload = {
                     "jql": jql,
-                    "fields": ["project", "summary", "parent", "issuetype", "customfield_10485", "customfield_10001", "status", "created", "updated", "resolutiondate"],
-                    "maxResults": 100
+                    "fields": [
+                        "project", "summary", "parent", "issuetype",
+                        "customfield_10485", "customfield_10001",
+                        "status", "created", "updated", "resolutiondate"
+                    ],
+                    "maxResults": 1000
                 }
                 if next_page_token:
                     payload["nextPageToken"] = next_page_token
-                
-                async with session.post(
-                    f"{JIRA_BASE_URL}/rest/api/3/search/jql",
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=60)
-                ) as resp:
-                    if resp.status != 200:
-                        break
-                    data = await resp.json()
-                
+
+                for attempt in range(MAX_RETRIES):
+                    try:
+                        async with session.post(
+                            f"{JIRA_BASE_URL}/rest/api/3/search/jql",
+                            json=payload,
+                            timeout=aiohttp.ClientTimeout(total=600)
+                        ) as resp:
+                            if resp.status != 200:
+                                break
+                            data = await resp.json()
+                            break
+                    except Exception:
+                        await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+                else:
+                    break
+
                 batch = data.get("issues", [])
                 if not batch:
                     break
@@ -424,8 +562,7 @@ async def get_issues(req: func.HttpRequest) -> func.HttpResponse:
                 next_page_token = data.get("nextPageToken")
                 if not next_page_token or data.get("isLast", False):
                     break
-        
-        # Build rows
+
         rows = []
         for issue in issues:
             fields = issue.get("fields", {})
@@ -435,7 +572,6 @@ async def get_issues(req: func.HttpRequest) -> func.HttpResponse:
             team = fields.get("customfield_10001")
             team_name = team.get("name") if isinstance(team, dict) else None
             goals_list = fields.get("customfield_10485") or []
-            
             rows.append({
                 "Issue_Key": issue["key"],
                 "Issue_Name": fields.get("summary"),
@@ -450,18 +586,19 @@ async def get_issues(req: func.HttpRequest) -> func.HttpResponse:
                 "Parent_Key": parent.get("key") if parent else None,
                 "Goal_ARI": goals_list[0].get("id") if goals_list else None
             })
-        
+
         df = pd.DataFrame(rows)
-        
-        # Join goals
         goals_df = fetch_goals()
         if not df.empty and not goals_df.empty:
-            df = df.merge(goals_df[["Goal_ARI", "Goal_Key", "Goal_Name_Lookup"]], on="Goal_ARI", how="left")
+            df = df.merge(
+                goals_df[["Goal_ARI", "Goal_Key", "Goal_Name_Lookup"]],
+                on="Goal_ARI", how="left"
+            )
             df.rename(columns={"Goal_Name_Lookup": "Goal"}, inplace=True)
         else:
             df["Goal_Key"] = None
             df["Goal"] = None
-        
+
         return func.HttpResponse(
             df.to_json(orient='records', date_format='iso'),
             mimetype="application/json"
