@@ -517,18 +517,28 @@ async def get_issues(req: func.HttpRequest) -> func.HttpResponse:
             "Accept": "application/json"
         }
 
-        jql = (
-            f"project IN ({projects_str}) "
-            f"AND issuetype IN (Epic, Feature, Story, Solution, Task, 'Tech Enabler', 'Triage Task') "
-            f"AND created >= '2024-01-01'"
-        )
-        issues = []
-        next_page_token = None
-
         async with aiohttp.ClientSession(headers=headers) as session:
+            # Fetch goals and epics once
+            goals_df = fetch_goals()
+            goal_lookup = {
+                row["Goal_ARI"]: row["Goal_Name_Lookup"]
+                for _, row in goals_df.iterrows()
+            } if not goals_df.empty else {}
+
+            epic_dict = await fetch_all_epics(session, projects_list)
+
+            # Fetch issues
+            issue_jql = (
+                f"project IN ({projects_str}) "
+                f"AND issuetype IN (Epic, Feature, Story, Solution, Task, 'Tech Enabler', 'Triage Task') "
+                f"AND updated >= '2025-12-01'"
+            )
+            issues = []
+            next_page_token = None
+
             while True:
                 payload = {
-                    "jql": jql,
+                    "jql": issue_jql,
                     "fields": [
                         "project", "summary", "parent", "issuetype",
                         "customfield_10485", "customfield_10001",
@@ -544,10 +554,16 @@ async def get_issues(req: func.HttpRequest) -> func.HttpResponse:
                         async with session.post(
                             f"{JIRA_BASE_URL}/rest/api/3/search/jql",
                             json=payload,
-                            timeout=aiohttp.ClientTimeout(total=600)
+                            timeout=aiohttp.ClientTimeout(total=60)
                         ) as resp:
+                            if resp.status == 429:
+                                await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+                                continue
                             if resp.status != 200:
-                                break
+                                return func.HttpResponse(
+                                    json.dumps({"error": f"Jira returned {resp.status}"}),
+                                    mimetype="application/json", status_code=502
+                                )
                             data = await resp.json()
                             break
                     except Exception:
@@ -563,6 +579,7 @@ async def get_issues(req: func.HttpRequest) -> func.HttpResponse:
                 if not next_page_token or data.get("isLast", False):
                     break
 
+        # Build rows
         rows = []
         for issue in issues:
             fields = issue.get("fields", {})
@@ -571,7 +588,16 @@ async def get_issues(req: func.HttpRequest) -> func.HttpResponse:
             issue_type_name = fields.get("issuetype", {}).get("name")
             team = fields.get("customfield_10001")
             team_name = team.get("name") if isinstance(team, dict) else None
-            goals_list = fields.get("customfield_10485") or []
+
+            if issue_type_name == "Epic":
+                epic_info = epic_dict.get(issue["key"])
+            elif parent:
+                epic_info = epic_dict.get(parent["key"])
+            else:
+                epic_info = None
+
+            goal_ari = epic_info["Goal_ARI"] if epic_info else None
+
             rows.append({
                 "Issue_Key": issue["key"],
                 "Issue_Name": fields.get("summary"),
@@ -584,20 +610,12 @@ async def get_issues(req: func.HttpRequest) -> func.HttpResponse:
                 "Updated_Date": fields.get("updated"),
                 "Resolved_Date": fields.get("resolutiondate"),
                 "Parent_Key": parent.get("key") if parent else None,
-                "Goal_ARI": goals_list[0].get("id") if goals_list else None
+                "Epic_Key": epic_info["Epic_Key"] if epic_info else None,
+                "Epic_Name": epic_info["Epic_Name"] if epic_info else None,
+                "Goal": goal_lookup.get(goal_ari)
             })
 
         df = pd.DataFrame(rows)
-        goals_df = fetch_goals()
-        if not df.empty and not goals_df.empty:
-            df = df.merge(
-                goals_df[["Goal_ARI", "Goal_Key", "Goal_Name_Lookup"]],
-                on="Goal_ARI", how="left"
-            )
-            df.rename(columns={"Goal_Name_Lookup": "Goal"}, inplace=True)
-        else:
-            df["Goal_Key"] = None
-            df["Goal"] = None
 
         return func.HttpResponse(
             df.to_json(orient='records', date_format='iso'),
